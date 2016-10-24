@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/rs/xid"
-	"github.com/LDCS/sflag"
+	"github.com/alexflint/go-arg"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"io"
@@ -170,7 +170,7 @@ func (c SessionReader) Read(p []byte) (int, error) {
 }
 
 func (c *Connection) Run(s *Session, cmd string, cancel chan void) (err error) {
-	defer s.Done()
+	defer func() { s.sigchild <- void{} } ()
 
 	if c.IsDead {
 		s.Queue <- Event(fmt.Sprintf(`[%q, "dead", null]`, c.key))
@@ -270,6 +270,7 @@ func (c *Connection) Run(s *Session, cmd string, cancel chan void) (err error) {
 		if err = ch.Close(); err != nil {
 			log.Printf("Cannot close: %v\n", err)
 		}
+		log.Println("Terminated.")
 	}
 
 	s.Lock()
@@ -302,7 +303,8 @@ type Session struct {
 	Interactive bool
 
 	sync.Mutex
-	sync.WaitGroup
+
+	sigchild chan void
 }
 
 func (s Session) Dead() bool {
@@ -351,6 +353,7 @@ func (s *Session) Run(cmd string) {
 	s.Unlock()
 
 	channels := make(map[string]chan void)
+	s.sigchild = make(chan void)
 
 	go func() {
 		for token := range s.terminator {
@@ -386,14 +389,15 @@ func (s *Session) Run(cmd string) {
 				switch st {
 				case C_RUNNING:
 					channels[k] <- void{}
-				case C_PENDING:
-					fallthrough
 				case C_UNKNOWN:
+					fallthrough
+				case C_PENDING:
 					s.Lock()
 					s.Queue <- Event(fmt.Sprintf(`[%q, "error", "killed"]`, k))
 					s.Queue <- Event(fmt.Sprintf(`[%q, "exit", 255]`, k))
 					c.Close()
 					s.Unlock()
+					s.sigchild <- void{}
 				default:
 					log.Printf("Job %s was in state %s, cannot terminate.\n", k, st)
 				}
@@ -414,8 +418,6 @@ func (s *Session) Run(cmd string) {
 			log.Printf("Skipping %s due to termination status.\n", c.key)
 			s.Queue <- Event(fmt.Sprintf(`[%q, "error", "killed"]`, c.key))
 			continue
-		} else {
-			s.Add(1)
 		}
 
 		select {
@@ -434,13 +436,15 @@ func (s *Session) Run(cmd string) {
 				<- MaxConnections
 				s.Lock()
 				isDead := s.IsDead
+				prevStatus := s.Status[c.key]
 				s.Status[c.key] = C_DEAD
 				s.Unlock()
 				if ! isDead {
 					log.Printf("Start failed: %v\n", err)
+					if prevStatus == C_TERMINATED { return }
 					s.Queue <- Event(fmt.Sprintf(`[%q, "error", %q]`, c.key, err))
 					s.Queue <- Event(fmt.Sprintf(`[%q, "exit", 255]`, c.key))
-					s.Done()
+					s.sigchild <- void{}
 					return
 				}
 			}
@@ -452,7 +456,17 @@ func (s *Session) Run(cmd string) {
 	}
 
 	go func() {
-		s.Wait()
+		for _ = range s.sigchild {
+			alive := 0
+			s.Lock()
+			for _, st := range s.Status {
+				if st != C_TERMINATED && st != C_DEAD && st != C_DONE {
+					alive += 1
+				}
+			}
+			s.Unlock()
+			if alive == 0 { break }
+		}
 		log.Printf("Session %s is done.\n", s.Id)
 
 		s.Lock()
@@ -470,6 +484,7 @@ var (
 	ErrConnectionIsDead  = errors.New("Connection is dead")
 	ErrTerminated        = errors.New("SSH session has been terminated")
 	ErrSSHNoAuthMethods  = errors.New("No valid SSH authentication methods found")
+	ErrInvalidCookie     = errors.New("Invalid authorization cookie")
 	SSHConfig            = &ssh.ClientConfig{
 		User: os.Getenv("LOGNAME"),
 	}
@@ -577,11 +592,30 @@ func NewSession(id string, hosts []string) *Session {
 
 var Config = struct {
 	Server string "IP to listen on | ::1"
-	ServerPort string "Port | 53353"
-	Password string "User password"
-	MaxConnections int "Maximum number of concurrent connections | 512"
-	MaxPersist int "Maximum time for a connection to persist (in seconds) | 30"
-}{}
+	Port int `json:"server_port",arg:"-p,help:port number"`
+	Password string `arg:"-"`
+	MaxConnections int `arg:"-m"`
+	MaxPersist int `arg:"-t"`
+	Cookie string `arg:"-C"`
+}{
+	Server: "::1",
+	Port: 53353,
+	MaxConnections: 512,
+	MaxPersist: 30,
+}
+
+func ValidateCookie() gin.HandlerFunc {
+	log.Println("Setting up cookie middleware.")
+
+	return func(c *gin.Context) {
+		if "Cookie " + Config.Cookie != c.Request.Header.Get("Authorization") {
+			c.AbortWithError(http.StatusForbidden, ErrInvalidCookie)
+			return
+		}
+
+		c.Next()
+	}
+}
 
 func ConnectionReaper() {
 	freeTimers := make(map[string]*time.Timer)
@@ -674,13 +708,13 @@ func ConnectionReaper() {
 	panic("reaper exit")
 }
 
-func main() {
-	log.SetFlags(0)
-	log.SetOutput(new(logWriter))
-
-	gin.SetMode(gin.ReleaseMode)
-
+func makeRouter() *gin.Engine {
 	router := gin.Default()
+
+	if Config.Cookie != "" {
+		router.Use(ValidateCookie())
+	}
+
 	router.GET("/ping", func(c *gin.Context) {
 		c.String(http.StatusOK, "OK")
 	})
@@ -844,6 +878,15 @@ func main() {
 		Slock.RUnlock()
 	})
 
+	return router
+}
+
+func main() {
+	log.SetFlags(0)
+	log.SetOutput(new(logWriter))
+
+	gin.SetMode(gin.ReleaseMode)
+
 	go ConnectionReaper()
 
 	usr, err := user.Current()
@@ -857,12 +900,14 @@ func main() {
 		if err != nil { panic(err) }
 	}
 
-	sflag.Parse(&Config)
+	arg.MustParse(&Config)
+
+	router := makeRouter()
 
 	MaxConnections = make(chan void, Config.MaxConnections)
 	SSHConfig.Auth = SSHAuth()
 
-	addr := net.JoinHostPort(Config.Server, Config.ServerPort)
+	addr := net.JoinHostPort(Config.Server, fmt.Sprintf("%d", Config.Port))
 	log.Printf("Starting on %s…", addr)
 
 	panic(router.Run(addr))
