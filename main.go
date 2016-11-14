@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/alexflint/go-arg"
 	"github.com/gin-gonic/gin"
 	"github.com/rs/xid"
-	"github.com/alexflint/go-arg"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"io"
@@ -101,6 +101,7 @@ func (c *Connection) Start() (err error) {
 		&ssh.ClientConfig{
 			User: c.user,
 			Auth: SSHConfig.Auth,
+			Timeout: SSHConfig.Timeout,
 		},
 	)
 
@@ -121,7 +122,7 @@ func (c *Connection) Close() (err error) {
 
 	c.IsDead = true
 	err = c.client.Close()
-	<- MaxConnections
+	<-MaxConnections
 	return err
 }
 
@@ -170,7 +171,7 @@ func (c SessionReader) Read(p []byte) (int, error) {
 }
 
 func (c *Connection) Run(s *Session, cmd string, cancel chan void) (err error) {
-	defer func() { s.sigchild <- void{} } ()
+	defer func() { s.sigchild <- void{} }()
 
 	if c.IsDead {
 		s.Queue <- Event(fmt.Sprintf(`[%q, "dead", null]`, c.key))
@@ -352,8 +353,9 @@ func (s *Session) Run(cmd string) {
 	s.IsDead = false
 	s.Unlock()
 
+	chanlock := sync.RWMutex{}
 	channels := make(map[string]chan void)
-	s.sigchild = make(chan void)
+	s.sigchild = make(chan void, len(s.children))
 
 	go func() {
 		for token := range s.terminator {
@@ -388,7 +390,9 @@ func (s *Session) Run(cmd string) {
 				s.Unlock()
 				switch st {
 				case C_RUNNING:
+					chanlock.RLock()
 					channels[k] <- void{}
+					chanlock.RUnlock()
 				case C_UNKNOWN:
 					fallthrough
 				case C_PENDING:
@@ -414,7 +418,7 @@ func (s *Session) Run(cmd string) {
 			break
 		}
 
-		if isTerminated { 
+		if isTerminated {
 			log.Printf("Skipping %s due to termination status.\n", c.key)
 			s.Queue <- Event(fmt.Sprintf(`[%q, "error", "killed"]`, c.key))
 			continue
@@ -433,25 +437,28 @@ func (s *Session) Run(cmd string) {
 			s.Unlock()
 			err := c.Start()
 			if err != nil {
-				<- MaxConnections
+				<-MaxConnections
 				s.Lock()
 				isDead := s.IsDead
 				prevStatus := s.Status[c.key]
 				s.Status[c.key] = C_DEAD
 				s.Unlock()
-				if ! isDead {
+				if !isDead {
 					log.Printf("Start failed: %v\n", err)
-					if prevStatus == C_TERMINATED { return }
+					if prevStatus == C_TERMINATED {
+						return
+					}
 					s.Queue <- Event(fmt.Sprintf(`[%q, "error", %q]`, c.key, err))
 					s.Queue <- Event(fmt.Sprintf(`[%q, "exit", 255]`, c.key))
 					s.sigchild <- void{}
 					return
 				}
 			}
-			s.Lock()
-			channels[c.key] = make(chan void)
-			s.Unlock()
-			go c.Run(s, cmd, channels[c.key])
+			t := make(chan void)
+			chanlock.Lock()
+			channels[c.key] = t
+			chanlock.Unlock()
+			go c.Run(s, cmd, t)
 		}(c)
 	}
 
@@ -465,7 +472,9 @@ func (s *Session) Run(cmd string) {
 				}
 			}
 			s.Unlock()
-			if alive == 0 { break }
+			if alive == 0 {
+				break
+			}
 		}
 		log.Printf("Session %s is done.\n", s.Id)
 
@@ -514,7 +523,9 @@ func makeSigner(keyname string) (signer ssh.Signer, err error) {
 	defer fp.Close()
 
 	buf, err := ioutil.ReadAll(fp)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	signer, err = ssh.ParsePrivateKey(buf)
 	return
 }
@@ -526,7 +537,9 @@ func makeKeyring() (signers []ssh.AuthMethod, err error) {
 
 	for _, keyname := range keys {
 		signer, err = makeSigner(keyname)
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		signers = append(signers, ssh.PublicKeys(signer))
 	}
 	return
@@ -534,7 +547,7 @@ func makeKeyring() (signers []ssh.AuthMethod, err error) {
 
 func SSHAuth() []ssh.AuthMethod {
 	methods := []ssh.AuthMethod{}
-	
+
 	m, err := SSHAgent()
 	if err != nil {
 		log.Println("Cannot connect to SSH agent, trying local keys.")
@@ -591,24 +604,27 @@ func NewSession(id string, hosts []string) *Session {
 }
 
 var Config = struct {
-	Server string "IP to listen on | ::1"
-	Port int `json:"server_port",arg:"-p,help:port number"`
-	Password string `arg:"-"`
-	MaxConnections int `arg:"-m"`
-	MaxPersist int `arg:"-t"`
-	Cookie string `arg:"-C"`
+	Server         string "IP to listen on | ::1"
+	Port           int    `json:"server_port",arg:"-p,help:port number"`
+	Password       string `arg:"-"`
+	MaxConnections int    `arg:"-m"`
+	MaxPersist     int    `arg:"-t"`
+	Cookie         string `arg:"-C"`
+	ConnectTimeout int    `arg:"-T,help:SSH connection timeout (in seconds)"`
 }{
-	Server: "::1",
-	Port: 53353,
+	Server:         "::1",
+	Port:           53353,
 	MaxConnections: 512,
-	MaxPersist: 30,
+	MaxPersist:     30,
+	ConnectTimeout: 30,
 }
 
 func ValidateCookie() gin.HandlerFunc {
 	log.Println("Setting up cookie middleware.")
 
 	return func(c *gin.Context) {
-		if "Cookie " + Config.Cookie != c.Request.Header.Get("Authorization") {
+		if "Cookie "+Config.Cookie != c.Request.Header.Get("Authorization") &&
+			"Cookie: "+Config.Cookie != c.Request.Header.Get("Authorization") {
 			c.AbortWithError(http.StatusForbidden, ErrInvalidCookie)
 			return
 		}
@@ -626,7 +642,9 @@ func ConnectionReaper() {
 		if e.key != "" {
 			conn = Connections[e.key]
 			if conn == nil {
-				panic("reaper got invalid key")
+				log.Printf("Reaper got invalid key: %s\n", e.key)
+				Clock.Unlock()
+				continue
 			}
 		} else {
 			conn = nil
@@ -678,9 +696,13 @@ func ConnectionReaper() {
 			oldestV := time.Time{}
 			// sort connections by lastEvent
 			for k, v := range Connections {
-				if v.refCounter > 0 { continue }
+				if v.refCounter > 0 {
+					continue
+				}
 				_, ok := freeTimers[k]
-				if ! ok { continue }
+				if !ok {
+					continue
+				}
 				if oldestV.IsZero() || v.lastEvent.Before(oldestV) {
 					oldestK = k
 					oldestV = v.lastEvent
@@ -688,7 +710,7 @@ func ConnectionReaper() {
 			}
 			if oldestK != "" {
 				t := freeTimers[oldestK]
-				if t == nil { 
+				if t == nil {
 					log.Fatalf("No timer for %s!\n", oldestK)
 				}
 				if !t.Stop() {
@@ -699,7 +721,6 @@ func ConnectionReaper() {
 				}
 			} else {
 				log.Println("Cannot find a good candidate to stop.")
-				log.Println(Connections)
 			}
 		}
 		Clock.Unlock()
@@ -731,7 +752,6 @@ func makeRouter() *gin.Engine {
 		c.Writer.Header().Set("Content-Type", "application/json")
 		select {
 		case chunk := <-session.Queue:
-			// log.Println(chunk)
 			c.String(http.StatusOK, string(chunk))
 		default:
 			session.Lock()
@@ -890,14 +910,20 @@ func main() {
 	go ConnectionReaper()
 
 	usr, err := user.Current()
-	if err != nil { panic(err) }
+	if err != nil {
+		panic(err)
+	}
 	HomeDir = usr.HomeDir
 
 	for _, name := range []string{".emptyd.conf", ".empty.conf"} {
 		raw, err := ioutil.ReadFile(filepath.Join(HomeDir, name))
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		err = json.Unmarshal(raw, &Config)
-		if err != nil { panic(err) }
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	arg.MustParse(&Config)
@@ -906,6 +932,7 @@ func main() {
 
 	MaxConnections = make(chan void, Config.MaxConnections)
 	SSHConfig.Auth = SSHAuth()
+	SSHConfig.Timeout = time.Duration(Config.ConnectTimeout) * time.Second
 
 	addr := net.JoinHostPort(Config.Server, fmt.Sprintf("%d", Config.Port))
 	log.Printf("Starting on %s…", addr)
