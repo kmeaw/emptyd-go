@@ -625,6 +625,7 @@ func ValidateCookie() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if "Cookie "+Config.Cookie != c.Request.Header.Get("Authorization") &&
 			"Cookie: "+Config.Cookie != c.Request.Header.Get("Authorization") {
+			c.JSON(http.StatusForbidden, gin.H{"cookie": "bad"})
 			c.AbortWithError(http.StatusForbidden, ErrInvalidCookie)
 			return
 		}
