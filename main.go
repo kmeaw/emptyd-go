@@ -102,6 +102,7 @@ func (c *Connection) Start() (err error) {
 			User: c.user,
 			Auth: SSHConfig.Auth,
 			Timeout: SSHConfig.Timeout,
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		},
 	)
 
