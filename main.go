@@ -83,6 +83,7 @@ type Connection struct {
 	user string
 	host string
 
+	conn   net.Conn
 	client *ssh.Client
 
 	IsDead     bool
@@ -95,13 +96,26 @@ func (c *Connection) Start() (err error) {
 		return nil // already started
 	}
 
-	c.client, err = ssh.Dial(
+	c.conn, err = net.DialTimeout(
 		"tcp",
 		net.JoinHostPort(c.host, "22"),
+		SSHConfig.Timeout,
+	)
+
+	if err != nil {
+		c.IsDead = true
+		log.Printf("Could not dial %s: %v\n", c.host, err)
+		ReaperQueue <- ReaperEvent{c.key, R_DEAD}
+		return err
+	}
+
+	sshconn, chans, reqs, err := ssh.NewClientConn(
+		c.conn,
+		net.JoinHostPort(c.host, "22"),
 		&ssh.ClientConfig{
-			User: c.user,
-			Auth: SSHConfig.Auth,
-			Timeout: SSHConfig.Timeout,
+			User:            c.user,
+			Auth:            SSHConfig.Auth,
+			Timeout:         SSHConfig.Timeout,
 			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		},
 	)
@@ -112,6 +126,8 @@ func (c *Connection) Start() (err error) {
 		ReaperQueue <- ReaperEvent{c.key, R_DEAD}
 		return err
 	}
+
+	c.client = ssh.NewClient(sshconn, chans, reqs)
 
 	return nil
 }
@@ -220,9 +236,14 @@ func (c *Connection) Run(s *Session, cmd string, cancel chan void) (err error) {
 
 	err = ch.Start(cmd)
 	if err != nil {
+		s.Lock()
+		s.Status[c.key] = C_DEAD
+		s.Queue <- Event(fmt.Sprintf(`[%q, "error", %q]`, c.key, err))
+		s.Queue <- Event(fmt.Sprintf(`[%q, "exit", 255]`, c.key))
+		s.Unlock()
 		ReaperQueue <- ReaperEvent{c.key, R_DEAD}
 		c.IsDead = true
-		log.Printf("Cannot start ssh session: %v\n", err)
+		log.Printf("Cannot start ssh session: %q: %v\n", c.key, err)
 		return err
 	}
 
@@ -355,7 +376,7 @@ func (s *Session) Run(cmd string) {
 	s.Unlock()
 
 	chanlock := sync.RWMutex{}
-	channels := make(map[string]chan void)
+	channels := make(map[string]chan void, 10)
 	s.sigchild = make(chan void, len(s.children))
 
 	go func() {
@@ -455,7 +476,7 @@ func (s *Session) Run(cmd string) {
 					return
 				}
 			}
-			t := make(chan void)
+			t := make(chan void, 10)
 			chanlock.Lock()
 			channels[c.key] = t
 			chanlock.Unlock()
